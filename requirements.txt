@@ -1,0 +1,5 @@
+torch==2.7.0
+transformers==4.52.3
+gradio==5.31.0
+numpy==2.2.6
+# Add other direct dependencies if known, otherwise pip will resolve sub-dependencies. 
