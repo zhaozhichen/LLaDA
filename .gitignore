@@ -1,0 +1,12 @@
+# macOS
+.DS_Store
+
+# Gradio cache
+.gradio/
+__pycache__/
+
+# Virtual environment
+venv/
+*.pyc
+*.pyo
+*.pyd 

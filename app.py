@@ -6,6 +6,16 @@ from transformers import AutoTokenizer, AutoModel
 import time
 import re
 
+# Helper function to convert history to Gradio 'messages' format
+
+def history_to_messages(history):
+    messages = []
+    for user_msg, assistant_msg in history:
+        messages.append({"role": "user", "content": user_msg})
+        if assistant_msg is not None:
+            messages.append({"role": "assistant", "content": assistant_msg})
+    return messages
+
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f"Using device: {device}")
 
@@ -299,11 +309,13 @@ def create_chatbot_demo():
         
         # STATE MANAGEMENT
         chat_history = gr.State([])
+        last_vis_states = gr.State([])
+        last_response_text = gr.State("")
         
         # UI COMPONENTS
         with gr.Row():
             with gr.Column(scale=3):
-                chatbot_ui = gr.Chatbot(label="Conversation", height=500)
+                chatbot_ui = gr.Chatbot(label="Conversation", height=500, type='messages')
                 
                 # Message input
                 with gr.Group():
@@ -341,7 +353,7 @@ def create_chatbot_demo():
                 )
             with gr.Row():
                 temperature = gr.Slider(
-                    minimum=0.0, maximum=1.0, value=0.0, step=0.1,
+                    minimum=0.0, maximum=1.0, value=0.5, step=0.1,
                     label="Temperature"
                 )
                 cfg_scale = gr.Slider(
@@ -355,13 +367,25 @@ def create_chatbot_demo():
                 )
                 remasking_strategy = gr.Radio(
                     choices=["low_confidence", "random"],
-                    value="low_confidence",
+                    value="random",
                     label="Remasking Strategy"
                 )
             with gr.Row():
-                visualization_delay = gr.Slider(
-                    minimum=0.0, maximum=1.0, value=0.1, step=0.1,
-                    label="Visualization Delay (seconds)"
+                # Replace visualization_delay slider with speed adjust bar
+                speed_options = [
+                    ("*0.25", 0.4),
+                    ("*0.5", 0.2),
+                    ("*1", 0.1),
+                    ("*1.5", 0.066),
+                    ("*2", 0.05)
+                ]
+                speed_labels = [opt[0] for opt in speed_options]
+                speed_values = [opt[1] for opt in speed_options]
+                speed_map = dict(speed_options)
+                speed_select = gr.Radio(
+                    choices=speed_labels,
+                    value="*1",
+                    label="Visualization Speed"
                 )
         
         # Current response text box (hidden)
@@ -374,6 +398,20 @@ def create_chatbot_demo():
         
         # Clear button
         clear_btn = gr.Button("Clear Conversation")
+        # Add Replay button
+        replay_btn = gr.Button("Replay Denoising")
+        
+        # Add replay progress slider
+        replay_progress = gr.Slider(
+            minimum=0,
+            maximum=1,  # Changed from 0 to 1 to ensure initial non-zero range
+            value=0,
+            step=1,
+            label="Replay Progress",
+            interactive=True,
+            visible=True
+        )
+        current_replay_step = gr.State(0)
         
         # HELPER FUNCTIONS
         def add_message(history, message, response):
@@ -382,48 +420,46 @@ def create_chatbot_demo():
             history.append([message, response])
             return history
             
-        def user_message_submitted(message, history, gen_length, steps, constraints, delay):
+        def user_message_submitted(message, history, gen_length, steps, constraints, speed_label):
             """Process a submitted user message"""
             # Skip empty messages
             if not message.strip():
                 # Return current state unchanged
                 history_for_display = history.copy()
-                return history, history_for_display, "", [], ""
-                
+                debug_out = history_to_messages(history_for_display)
+                print("DEBUG chatbot_ui output (user_message_submitted empty):", debug_out)
+                return history, debug_out, "", [], "", [], ""
             # Add user message to history
             history = add_message(history, message, None)
-            
             # Format for display - temporarily show user message with empty response
             history_for_display = history.copy()
-            
             # Clear the input
             message_out = ""
+            debug_out = history_to_messages(history_for_display)
+            print("DEBUG chatbot_ui output (user_message_submitted):", debug_out)
+            return history, debug_out, message_out, [], "", [], ""
             
-            # Return immediately to update UI with user message
-            return history, history_for_display, message_out, [], ""
-            
-        def bot_response(history, gen_length, steps, constraints, delay, temperature, cfg_scale, block_length, remasking):
+        def bot_response(history, gen_length, steps, constraints, speed_label, temperature, cfg_scale, block_length, remasking):
             """Generate bot response for the latest message"""
+            # history is the gr.State's value
             if not history:
-                return history, [], ""
-                
-            # Get the last user message
-            last_user_message = history[-1][0]
+                processed_chat_for_ui = history_to_messages([])
+                print("DEBUG chatbot_ui output (bot_response empty):", processed_chat_for_ui)
+                # chat_history, chatbot_ui, output_vis, current_response, last_vis_states, last_response_text
+                return [], processed_chat_for_ui, [], "", [], ""
             
+            last_user_message = history[-1][0]
             try:
-                # Format all messages except the last one (which has no response yet)
-                messages = format_chat_history(history[:-1])
+                messages_for_model = format_chat_history(history[:-1])
+                messages_for_model.append({"role": "user", "content": last_user_message})
                 
-                # Add the last user message
-                messages.append({"role": "user", "content": last_user_message})
-                
-                # Parse constraints
                 parsed_constraints = parse_constraints(constraints)
+                speed_map = {"*0.25": 0.4, "*0.5": 0.2, "*1": 0.1, "*1.5": 0.066, "*2": 0.05}
+                delay = speed_map.get(speed_label, 0.1)
                 
-                # Generate response with visualization
                 vis_states, response_text = generate_response_with_visualization(
                     model, tokenizer, device, 
-                    messages, 
+                    messages_for_model, 
                     gen_length=gen_length, 
                     steps=steps,
                     constraints=parsed_constraints,
@@ -433,30 +469,71 @@ def create_chatbot_demo():
                     remasking=remasking
                 )
                 
-                # Update history with the assistant's response
-                history[-1][1] = response_text
+                history[-1][1] = response_text # Modify the history state
                 
-                # Return the initial state immediately
-                yield history, vis_states[0], response_text
+                processed_chat_for_ui = history_to_messages(history)
+                # Add debug prints here
+                print(f"DEBUG bot_response inputs: gen_length={gen_length}, steps={steps}, block_length={block_length}, remasking={remasking}, temp={temperature}, cfg={cfg_scale}")
+                print(f"DEBUG bot_response: len(vis_states) from generate_response_with_visualization = {len(vis_states)}")
+
+                print("DEBUG chatbot_ui output (bot_response first yield):", processed_chat_for_ui)
+                # chat_history (raw), chatbot_ui (processed), output_vis, current_response, last_vis_states, last_response_text
+                yield history, processed_chat_for_ui, vis_states[0], response_text, vis_states, response_text
                 
-                # Then animate through visualization states
-                for state in vis_states[1:]:
+                for state_vis in vis_states[1:]: # Renamed 'state' to 'state_vis' to avoid conflict if 'history' becomes gr.State object
                     time.sleep(delay)
-                    yield history, state, response_text
-                    
+                    # history object is already updated, processed_chat_for_ui uses the updated history
+                    processed_chat_for_ui = history_to_messages(history) 
+                    print("DEBUG chatbot_ui output (bot_response yield):", processed_chat_for_ui)
+                    yield history, processed_chat_for_ui, state_vis, response_text, vis_states, response_text
             except Exception as e:
-                error_msg = f"Error: {str(e)}"
-                print(error_msg)
-                
-                # Show error in visualization
+                error_msg = str(e)
+                print(f"Error in bot_response: {error_msg}")
                 error_vis = [(error_msg, "red")]
-                
-                # Don't update history with error
-                yield history, error_vis, error_msg
+                processed_chat_for_ui = history_to_messages(history) # Show current history even on error
+                print("DEBUG chatbot_ui output (bot_response error):", processed_chat_for_ui)
+                # chat_history, chatbot_ui, output_vis, current_response, last_vis_states, last_response_text
+                yield history, processed_chat_for_ui, error_vis, error_msg, [], error_msg
         
         def clear_conversation():
             """Clear the conversation history"""
-            return [], [], "", []
+            # Prepare the correctly formatted empty history for the chatbot UI
+            processed_empty_history_for_ui = history_to_messages([])
+            print("DEBUG chatbot_ui output (clear_conversation):", processed_empty_history_for_ui)
+            
+            # chat_history (state), chatbot_ui, current_response, output_vis, last_vis_states, last_response_text
+            return [], processed_empty_history_for_ui, "", [], [], ""
+        
+        def replay_denoising(vis_states, response_text, history, speed_label):
+            speed_map = {"*0.25": 0.4, "*0.5": 0.2, "*1": 0.1, "*1.5": 0.066, "*2": 0.05}
+            delay = speed_map.get(speed_label, 0.1)
+            debug_out_history = history_to_messages(history) # Prepare history for chatbot once
+
+            if not vis_states:
+                print("DEBUG chatbot_ui output (replay_denoising empty):", debug_out_history)
+                # chatbot_ui, output_vis, current_response, replay_progress (value update), replay_progress (max update)
+                return debug_out_history, [], response_text, gr.update(value=0), gr.update(maximum=1) # Keep a valid range
+            
+            max_step = len(vis_states) - 1
+            for i, state_vis in enumerate(vis_states):
+                time.sleep(delay)
+                print(f"DEBUG chatbot_ui output (replay_denoising step {i}):", debug_out_history)
+                # chatbot_ui, output_vis, current_response, replay_progress (value + max update), replay_progress (value + max update)
+                # We yield the same gr.update object to both slider outputs. Gradio should handle this.
+                slider_update = gr.update(value=i, maximum=max_step)
+                yield debug_out_history, state_vis, response_text, slider_update, slider_update
+
+        def set_replay_step(vis_states, response_text, history, step):
+            processed_history_for_ui = history_to_messages(history)
+            if not vis_states or step is None or not isinstance(step, int) or step < 0 or step >= len(vis_states):
+                print("DEBUG chatbot_ui output (set_replay_step empty or invalid step):", processed_history_for_ui)
+                # chatbot_ui, output_vis, current_response
+                return processed_history_for_ui, [], response_text 
+            
+            current_vis_frame = vis_states[step]
+            print(f"DEBUG chatbot_ui output (set_replay_step to {step}):", processed_history_for_ui)
+            # chatbot_ui, output_vis, current_response
+            return processed_history_for_ui, current_vis_frame, response_text
         
         # EVENT HANDLERS
         
@@ -464,22 +541,22 @@ def create_chatbot_demo():
         clear_btn.click(
             fn=clear_conversation,
             inputs=[],
-            outputs=[chat_history, chatbot_ui, current_response, output_vis]
+            outputs=[chat_history, chatbot_ui, current_response, output_vis, last_vis_states, last_response_text]
         )
         
         # User message submission flow (2-step process)
         # Step 1: Add user message to history and update UI
         msg_submit = user_input.submit(
             fn=user_message_submitted,
-            inputs=[user_input, chat_history, gen_length, steps, constraints_input, visualization_delay],
-            outputs=[chat_history, chatbot_ui, user_input, output_vis, current_response]
+            inputs=[user_input, chat_history, gen_length, steps, constraints_input, speed_select],
+            outputs=[chat_history, chatbot_ui, user_input, output_vis, current_response, last_vis_states, last_response_text]
         )
         
         # Also connect the send button
         send_click = send_btn.click(
             fn=user_message_submitted,
-            inputs=[user_input, chat_history, gen_length, steps, constraints_input, visualization_delay],
-            outputs=[chat_history, chatbot_ui, user_input, output_vis, current_response]
+            inputs=[user_input, chat_history, gen_length, steps, constraints_input, speed_select],
+            outputs=[chat_history, chatbot_ui, user_input, output_vis, current_response, last_vis_states, last_response_text]
         )
         
         # Step 2: Generate bot response
@@ -488,19 +565,33 @@ def create_chatbot_demo():
             fn=bot_response,
             inputs=[
                 chat_history, gen_length, steps, constraints_input, 
-                visualization_delay, temperature, cfg_scale, block_length,
+                speed_select, temperature, cfg_scale, block_length,
                 remasking_strategy
             ],
-            outputs=[chatbot_ui, output_vis, current_response]
+            outputs=[chat_history, chatbot_ui, output_vis, current_response, last_vis_states, last_response_text]
         )
         
         send_click.then(
             fn=bot_response,
             inputs=[
                 chat_history, gen_length, steps, constraints_input, 
-                visualization_delay, temperature, cfg_scale, block_length,
+                speed_select, temperature, cfg_scale, block_length,
                 remasking_strategy
             ],
+            outputs=[chat_history, chatbot_ui, output_vis, current_response, last_vis_states, last_response_text]
+        )
+        
+        # Connect replay button
+        replay_btn.click(
+            fn=replay_denoising,
+            inputs=[last_vis_states, last_response_text, chat_history, speed_select],
+            outputs=[chatbot_ui, output_vis, current_response, replay_progress, replay_progress]
+        )
+        
+        # Connect slider to set frame
+        replay_progress.change(
+            fn=set_replay_step,
+            inputs=[last_vis_states, last_response_text, chat_history, replay_progress],
             outputs=[chatbot_ui, output_vis, current_response]
         )
         
