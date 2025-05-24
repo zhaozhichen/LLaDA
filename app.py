@@ -194,7 +194,7 @@ def generate_response_with_visualization(model, tokenizer, device, messages, gen
         num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps_per_block)
         
         # Process each step
-        for i in range(steps_per_block):
+        for step_idx in range(steps_per_block):
             # Get all mask positions in the current sequence
             mask_index = (x == MASK_ID)
             
@@ -240,10 +240,10 @@ def generate_response_with_visualization(model, tokenizer, device, messages, gen
             for j in range(confidence.shape[0]):
                 # Only consider positions within the current block for unmasking
                 block_confidence = confidence[j, block_start:block_end]
-                if i < steps_per_block - 1:  # Not the last step
+                if step_idx < steps_per_block - 1:  # Not the last step
                     # Take top-k confidences
                     _, select_indices = torch.topk(block_confidence, 
-                                                  k=min(num_transfer_tokens[j, i].item(), 
+                                                  k=min(num_transfer_tokens[j, step_idx].item(), 
                                                        block_confidence.numel()))
                     # Adjust indices to global positions
                     select_indices = select_indices + block_start
@@ -260,33 +260,34 @@ def generate_response_with_visualization(model, tokenizer, device, messages, gen
                 if absolute_pos < x.shape[1]:
                     x[:, absolute_pos] = token_id
             
-            # Create visualization state only for the response part
+            # Create visualization state for the CURRENT step
             current_state = []
-            for i in range(gen_length):
-                pos = prompt_length + i  # Absolute position in the sequence
+            for vis_idx in range(gen_length):
+                pos = prompt_length + vis_idx
                 
                 if x[0, pos] == MASK_ID:
-                    # Still masked
-                    current_state.append((MASK_TOKEN, "#444444"))  # Dark gray for masks
-                    
-                elif old_x[0, pos] == MASK_ID:
-                    # Newly revealed in this step
-                    token = tokenizer.decode([x[0, pos].item()], skip_special_tokens=True)
-                    # Color based on confidence
-                    confidence = float(x0_p[0, pos].cpu())
-                    if confidence < 0.3:
-                        color = "#FF6666"  # Light red
-                    elif confidence < 0.7:
-                        color = "#FFAA33"  # Orange
-                    else:
-                        color = "#66CC66"  # Light green
+                    if old_x[0, pos] == MASK_ID:
+                        # Still masked, show the just-predicted token (transient) from x0
+                        predicted_token_id = x0[0, pos].item()
+                        transient_token_str_raw = tokenizer.decode([predicted_token_id], skip_special_tokens=False)
+                        display_candidate = transient_token_str_raw.strip()
                         
-                    current_state.append((token, color))
-                    
-                else:
-                    # Previously revealed
-                    token = tokenizer.decode([x[0, pos].item()], skip_special_tokens=True)
-                    current_state.append((token, "#6699CC"))  # Light blue
+                        text_to_italicize = MASK_TOKEN if not display_candidate else display_candidate
+                                                
+                        final_text_for_vis = f"_{text_to_italicize}_" # Apply italics, (p) prefix removed
+                        
+                        current_state.append((final_text_for_vis, "#888888")) # Medium gray italic for predicted for masked slot
+                    else:
+                        # This implies a token was revealed and then re-masked by the main loop before visualization of this step.
+                        current_state.append((MASK_TOKEN, "#444444")) # Dark gray for basic MASK
+                elif old_x[0, pos] == MASK_ID: # Newly revealed token (was MASK_ID, now it's not)
+                    token_text = tokenizer.decode([x[0, pos].item()], skip_special_tokens=True)
+                    color = "#66CC66"  # Light Green for all newly revealed tokens (no confidence distinction)
+                    current_state.append((token_text, color))
+                else: # Previously revealed and still revealed (was not MASK_ID, is still not MASK_ID)
+                    token_text = tokenizer.decode([x[0, pos].item()], skip_special_tokens=True)
+                    color = "#6699CC"  # Light blue for stable revealed tokens
+                    current_state.append((token_text, color))
             
             visualization_states.append(current_state)
     
