@@ -593,7 +593,8 @@ def create_chatbot_demo():
         replay_progress.change(
             fn=set_replay_step,
             inputs=[last_vis_states, last_response_text, chat_history, replay_progress],
-            outputs=[chatbot_ui, output_vis, current_response]
+            outputs=[chatbot_ui, output_vis, current_response],
+            show_progress='hidden'
         )
         
     return demo
